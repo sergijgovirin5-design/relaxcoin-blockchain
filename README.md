@@ -1,2 +1,16 @@
-# relaxcoin-blockchain
-Experimental blockchain and smart contract development project
+# Blockchain Sample Implementations
+
+Этот каталог содержит простые примеры блокчейна на нескольких языках:
+- Rust
+- Go
+- Python
+- JavaScript
+- C#
+
+Каждый пример показывает:
+- базовую структуру блока и цепочки
+- майнинг с простым Proof-of-Work
+- модель транзакций
+- заглушки для P2P, оплаты Visa/Mastercard и выплат зарплаты
+
+> Важно: это учебные примеры. Для реального проекта нужны безопасные сети, проверка подписи, KYC/AML, PCI DSS для кредитных карт и интеграция с банковскими API.
