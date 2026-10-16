@@ -1,0 +1,149 @@
+{
+  "network": {
+    "name": "RelaxCoin Network",
+    "rpc_url": "http://localhost:8545",
+    "chain_id": 1
+  },
+  "mining": {
+    "mining_contract": "0x1234567890123456789012345678901234567890",
+    "private_key": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    "default_difficulty": 100,
+    "max_nonce_range": 4294967296
+  },
+  "gpu_profiles": {
+    "nvidia": {
+      "type": "CUDA",
+      "devices": [
+        {
+          "model": "RTX 3060",
+          "compute_capability": "8.6",
+          "threads_per_block": 256,
+          "blocks_per_grid": 32768,
+          "shared_memory": 49152,
+          "max_power": 170
+        },
+        {
+          "model": "RTX 3070",
+          "compute_capability": "8.6",
+          "threads_per_block": 256,
+          "blocks_per_grid": 65536,
+          "shared_memory": 49152,
+          "max_power": 220
+        },
+        {
+          "model": "RTX 3080",
+          "compute_capability": "8.6",
+          "threads_per_block": 256,
+          "blocks_per_grid": 65536,
+          "shared_memory": 49152,
+          "max_power": 320
+        },
+        {
+          "model": "RTX 3090",
+          "compute_capability": "8.6",
+          "threads_per_block": 256,
+          "blocks_per_grid": 65536,
+          "shared_memory": 49152,
+          "max_power": 420
+        },
+        {
+          "model": "RTX 4060",
+          "compute_capability": "8.9",
+          "threads_per_block": 256,
+          "blocks_per_grid": 32768,
+          "shared_memory": 49152,
+          "max_power": 115
+        },
+        {
+          "model": "RTX 4070",
+          "compute_capability": "8.9",
+          "threads_per_block": 256,
+          "blocks_per_grid": 65536,
+          "shared_memory": 49152,
+          "max_power": 200
+        },
+        {
+          "model": "RTX 4080",
+          "compute_capability": "8.9",
+          "threads_per_block": 256,
+          "blocks_per_grid": 65536,
+          "shared_memory": 49152,
+          "max_power": 320
+        },
+        {
+          "model": "RTX 4090",
+          "compute_capability": "8.9",
+          "threads_per_block": 256,
+          "blocks_per_grid": 65536,
+          "shared_memory": 49152,
+          "max_power": 450
+        }
+      ]
+    },
+    "amd": {
+      "type": "OpenCL/HIP",
+      "devices": [
+        {
+          "model": "RX 5700 XT",
+          "compute_units": 40,
+          "stream_processors": 2560,
+          "memory_gb": 8,
+          "max_power": 250
+        },
+        {
+          "model": "RX 6700 XT",
+          "compute_units": 36,
+          "stream_processors": 2304,
+          "memory_gb": 12,
+          "max_power": 230
+        },
+        {
+          "model": "RX 6800 XT",
+          "compute_units": 60,
+          "stream_processors": 3840,
+          "memory_gb": 16,
+          "max_power": 320
+        },
+        {
+          "model": "RX 6900 XT",
+          "compute_units": 80,
+          "stream_processors": 5120,
+          "memory_gb": 16,
+          "max_power": 405
+        },
+        {
+          "model": "RX 7900 XTX",
+          "compute_units": 96,
+          "stream_processors": 6144,
+          "memory_gb": 24,
+          "max_power": 500
+        }
+      ]
+    }
+  },
+  "performance": {
+    "adaptive_difficulty": true,
+    "difficulty_adjust_interval": 3600,
+    "target_share_time": 30,
+    "difficulty_min": 10,
+    "difficulty_max": 10000
+  },
+  "rewards": {
+    "auto_claim": true,
+    "claim_interval_hours": 24,
+    "min_claim_amount_r2r": 100
+  },
+  "monitoring": {
+    "log_level": "INFO",
+    "stats_interval_seconds": 60,
+    "health_check_interval": 300,
+    "telegram_bot_token": "",
+    "telegram_chat_id": ""
+  },
+  "pool": {
+    "enabled": false,
+    "pool_address": "pool.relaxcoin.io",
+    "pool_port": 3333,
+    "pool_fee_percent": 1.0
+  }
+}
