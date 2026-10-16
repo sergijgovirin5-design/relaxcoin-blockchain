@@ -1,0 +1,58 @@
+{
+  "chain": {
+    "name": "RelaxCoin",
+    "chainId": "relaxcoin-1",
+    "rpcUrl": "http://127.0.0.1:8545",
+    "p2pHost": "127.0.0.1",
+    "p2pPort": 26656,
+    "network": "EVM",
+    "nativeToken": "R2R",
+    "nativeTokenDecimals": 18
+  },
+  "pool": {
+    "host": "0.0.0.0",
+    "stratumPort": 5555,
+    "protocol": "stratum+tcp",
+    "difficultyMode": "auto",
+    "algorithms": [
+      {
+        "name": "kawpow",
+        "enabled": true,
+        "note": "GPU friendly for Nvidia"
+      },
+      {
+        "name": "randomx",
+        "enabled": true,
+        "note": "CPU/GPU friendly for Apple Silicon M1/M2/M3/M4"
+      }
+    ],
+    "shareVerification": {
+      "verifyOnChain": true,
+      "verifyOnSubmit": true,
+      "verificationTimeoutSeconds": 30,
+      "maxRetries": 3
+    }
+  },
+  "reward": {
+    "payoutWallet": "0xYourPoolRewardWallet",
+    "tokenAddress": "0xYourR2RTokenAddress",
+    "minimumPayout": "1000000000000000000",
+    "payoutIntervalSeconds": 3600,
+    "gasPriceGwei": 10,
+    "rewardFeePercent": 0,
+    "privateKeySource": "ENV",
+    "privateKeyEnvVar": "POOL_OWNER_PRIVATE_KEY"
+  },
+  "database": {
+    "type": "sqlite",
+    "path": "./pool.db"
+  },
+  "logging": {
+    "level": "info",
+    "path": "./logs/pool.log"
+  },
+  "security": {
+    "useTls": false,
+    "allowedOrigins": ["*"]
+  }
+}
