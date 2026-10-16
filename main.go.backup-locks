@@ -1,0 +1,621 @@
+package main
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	chainFile      = "/opt/relaxcoin/chain.json"
+	genesisTime    = int64(1735689600)
+	maxRequestSize = 1 << 20
+	blockReward    = uint64(50_000_000) // 50 RLC
+)
+
+const zeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
+
+type Block struct {
+	Number       uint64        `json:"number"`
+	Timestamp    int64         `json:"timestamp"`
+	Previous     string        `json:"previous"`
+	Hash         string        `json:"hash"`
+	Transactions []Transaction `json:"transactions,omitempty"`
+	RewardTo     string        `json:"rewardTo,omitempty"`
+	Reward       uint64        `json:"reward,omitempty"`
+}
+
+type Transaction struct {
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Amount    uint64 `json:"amount"`
+	Nonce     uint64 `json:"nonce"`
+	PublicKey string `json:"publicKey"`
+	Signature string `json:"signature"`
+}
+
+type signedData struct {
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Amount uint64 `json:"amount"`
+	Nonce  uint64 `json:"nonce"`
+}
+
+type Blockchain struct {
+	mu     sync.RWMutex
+	Blocks []Block
+}
+
+type RPCRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
+	ID      json.RawMessage `json:"id"`
+}
+
+type State struct {
+	Balances map[string]uint64
+	Nonces   map[string]uint64
+}
+
+var chain Blockchain
+var pending []Transaction
+
+func newState() *State {
+	return &State{
+		Balances: make(map[string]uint64),
+		Nonces:   make(map[string]uint64),
+	}
+}
+
+func createGenesis() Block {
+	b := Block{
+		Number:    0,
+		Timestamp: genesisTime,
+		Previous:  zeroHash,
+	}
+	b.Hash = calculateHash(b)
+	return b
+}
+
+// Keep the original hash formula for old blocks without transactions.
+// New blocks commit to their transactions and reward fields.
+func calculateHash(b Block) string {
+	if len(b.Transactions) == 0 && b.RewardTo == "" && b.Reward == 0 {
+		data := fmt.Sprintf("%d:%d:%s", b.Number, b.Timestamp, b.Previous)
+		sum := sha256.Sum256([]byte(data))
+		return hex.EncodeToString(sum[:])
+	}
+
+	payload := struct {
+		Number       uint64        `json:"number"`
+		Timestamp    int64         `json:"timestamp"`
+		Previous     string        `json:"previous"`
+		Transactions []Transaction `json:"transactions,omitempty"`
+		RewardTo     string        `json:"rewardTo,omitempty"`
+		Reward       uint64        `json:"reward,omitempty"`
+	}{
+		b.Number, b.Timestamp, b.Previous,
+		b.Transactions, b.RewardTo, b.Reward,
+	}
+
+	data, _ := json.Marshal(payload)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func addressFromPublicKey(pub []byte) string {
+	sum := sha256.Sum256(pub)
+	return hex.EncodeToString(sum[:20])
+}
+
+func validAddress(address string) bool {
+	if len(address) != 40 {
+		return false
+	}
+	_, err := hex.DecodeString(address)
+	return err == nil && address == strings.ToLower(address)
+}
+
+func transactionBytes(tx Transaction) ([]byte, error) {
+	return json.Marshal(signedData{
+		From: tx.From, To: tx.To,
+		Amount: tx.Amount, Nonce: tx.Nonce,
+	})
+}
+
+func verifyTransaction(tx Transaction) error {
+	if !validAddress(tx.From) || !validAddress(tx.To) {
+		return errors.New("invalid sender or recipient address")
+	}
+	if tx.From == tx.To {
+		return errors.New("sender and recipient must differ")
+	}
+	if tx.Amount == 0 {
+		return errors.New("amount must be greater than zero")
+	}
+
+	pub, err := hex.DecodeString(tx.PublicKey)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return errors.New("invalid public key")
+	}
+	if addressFromPublicKey(pub) != tx.From {
+		return errors.New("public key does not match sender address")
+	}
+
+	sig, err := hex.DecodeString(tx.Signature)
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return errors.New("invalid signature encoding")
+	}
+
+	data, err := transactionBytes(tx)
+	if err != nil {
+		return err
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pub), data, sig) {
+		return errors.New("signature verification failed")
+	}
+	return nil
+}
+
+func applyTransaction(s *State, tx Transaction) error {
+	if err := verifyTransaction(tx); err != nil {
+		return err
+	}
+
+	if tx.Nonce != s.Nonces[tx.From] {
+		return fmt.Errorf("invalid nonce: expected %d", s.Nonces[tx.From])
+	}
+	if s.Balances[tx.From] < tx.Amount {
+		return errors.New("insufficient balance")
+	}
+	if math.MaxUint64-s.Balances[tx.To] < tx.Amount {
+		return errors.New("recipient balance overflow")
+	}
+	if s.Nonces[tx.From] == math.MaxUint64 {
+		return errors.New("sender nonce overflow")
+	}
+
+	s.Balances[tx.From] -= tx.Amount
+	s.Balances[tx.To] += tx.Amount
+	s.Nonces[tx.From]++
+	return nil
+}
+
+func applyReward(s *State, b Block) error {
+	if b.RewardTo == "" {
+		if b.Reward != 0 {
+			return errors.New("reward amount without recipient")
+		}
+		return nil
+	}
+	if !validAddress(b.RewardTo) || b.Reward != blockReward {
+		return errors.New("invalid block reward")
+	}
+	if math.MaxUint64-s.Balances[b.RewardTo] < b.Reward {
+		return errors.New("reward balance overflow")
+	}
+	s.Balances[b.RewardTo] += b.Reward
+	return nil
+}
+
+func stateFromBlocks(blocks []Block) (*State, error) {
+	s := newState()
+	for i, b := range blocks {
+		for _, tx := range b.Transactions {
+			if err := applyTransaction(s, tx); err != nil {
+				return nil, fmt.Errorf("block %d transaction: %w", i, err)
+			}
+		}
+		if err := applyReward(s, b); err != nil {
+			return nil, fmt.Errorf("block %d: %w", i, err)
+		}
+	}
+	return s, nil
+}
+
+func validChain(blocks []Block) error {
+	if len(blocks) == 0 {
+		return errors.New("blockchain is empty")
+	}
+
+	genesis := createGenesis()
+	first := blocks[0]
+
+	if first.Number != genesis.Number ||
+		first.Timestamp != genesis.Timestamp ||
+		first.Previous != genesis.Previous ||
+		first.Hash != genesis.Hash ||
+		len(first.Transactions) != 0 ||
+		first.RewardTo != "" ||
+		first.Reward != 0 {
+		return errors.New("genesis block mismatch")
+	}
+
+	for i := 1; i < len(blocks); i++ {
+		prev := blocks[i-1]
+		curr := blocks[i]
+
+		if curr.Number != prev.Number+1 {
+			return errors.New("invalid block number")
+		}
+		if curr.Previous != prev.Hash {
+			return errors.New("invalid previous hash")
+		}
+		if calculateHash(curr) != curr.Hash {
+			return errors.New("invalid block hash")
+		}
+	}
+
+	if _, err := stateFromBlocks(blocks); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func saveChain(blocks []Block) error {
+	dir := filepath.Dir(chainFile)
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(blocks, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	f, err := os.CreateTemp(dir, ".chain-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+
+	if err := f.Chmod(0600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, chainFile)
+}
+
+func loadChain() error {
+	data, err := os.ReadFile(chainFile)
+	if errors.Is(err, os.ErrNotExist) {
+		initial := []Block{createGenesis()}
+		if err := saveChain(initial); err != nil {
+			return err
+		}
+		chain.Blocks = initial
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	var blocks []Block
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&blocks); err != nil {
+		return fmt.Errorf("cannot decode saved chain: %w", err)
+	}
+	var extra interface{}
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("unexpected trailing data in chain file")
+	}
+	if err := validChain(blocks); err != nil {
+		return fmt.Errorf("saved chain validation failed: %w", err)
+	}
+	chain.Blocks = blocks
+	return nil
+}
+
+func confirmedState() (*State, error) {
+	return stateFromBlocks(chain.Blocks)
+}
+
+func stateWithPending() (*State, error) {
+	s, err := confirmedState()
+	if err != nil {
+		return nil, err
+	}
+	for _, tx := range pending {
+		if err := applyTransaction(s, tx); err != nil {
+			return nil, err
+		}
+	}
+	return s, nil
+}
+
+func mineBlock(miner string) (Block, error) {
+	if !validAddress(miner) {
+		return Block{}, errors.New("invalid miner address")
+	}
+
+	chain.mu.Lock()
+	defer chain.mu.Unlock()
+
+	if err := validChain(chain.Blocks); err != nil {
+		return Block{}, fmt.Errorf("current chain is invalid: %w", err)
+	}
+
+	prev := chain.Blocks[len(chain.Blocks)-1]
+	now := time.Now().Unix()
+	if now < prev.Timestamp {
+		return Block{}, errors.New("system clock is earlier than previous block")
+	}
+
+	s, err := confirmedState()
+	if err != nil {
+		return Block{}, err
+	}
+
+	txs := make([]Transaction, 0, len(pending))
+	for _, tx := range pending {
+		if err := applyTransaction(s, tx); err != nil {
+			return Block{}, fmt.Errorf("pending transaction rejected: %w", err)
+		}
+		txs = append(txs, tx)
+	}
+
+	b := Block{
+		Number:       prev.Number + 1,
+		Timestamp:    now,
+		Previous:     prev.Hash,
+		Transactions: txs,
+		RewardTo:     miner,
+		Reward:       blockReward,
+	}
+	b.Hash = calculateHash(b)
+
+	candidate := make([]Block, len(chain.Blocks), len(chain.Blocks)+1)
+	copy(candidate, chain.Blocks)
+	candidate = append(candidate, b)
+
+	if err := validChain(candidate); err != nil {
+		return Block{}, err
+	}
+	if err := saveChain(candidate); err != nil {
+		return Block{}, fmt.Errorf("cannot persist new block: %w", err)
+	}
+
+	chain.Blocks = candidate
+	pending = nil
+	return b, nil
+}
+
+func writeResult(w http.ResponseWriter, id json.RawMessage, result interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"jsonrpc": "2.0", "id": id, "result": result,
+	})
+}
+
+func writeError(w http.ResponseWriter, id json.RawMessage, code int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error": map[string]interface{}{
+			"code": code, "message": message,
+		},
+	})
+}
+
+func paramsArray(raw json.RawMessage) ([]json.RawMessage, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var params []json.RawMessage
+	err := json.Unmarshal(raw, &params)
+	return params, err
+}
+
+func rpcHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
+	defer r.Body.Close()
+
+	dec := json.NewDecoder(r.Body)
+	var req RPCRequest
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, nil, -32700, "invalid JSON request")
+		return
+	}
+	var extra interface{}
+	if err := dec.Decode(&extra); err != io.EOF {
+		writeError(w, req.ID, -32600, "request must contain one JSON object")
+		return
+	}
+	if req.JSONRPC != "2.0" || req.Method == "" || len(req.ID) == 0 {
+		writeError(w, req.ID, -32600, "invalid JSON-RPC request")
+		return
+	}
+
+	params, err := paramsArray(req.Params)
+	if err != nil {
+		writeError(w, req.ID, -32602, "params must be an array")
+		return
+	}
+
+	chain.mu.Lock()
+	defer chain.mu.Unlock()
+
+	switch req.Method {
+	case "relax_createWallet":
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			writeError(w, req.ID, -32000, "wallet generation failed")
+			return
+		}
+		writeResult(w, req.ID, map[string]string{
+			"address":    addressFromPublicKey(pub),
+			"publicKey":  hex.EncodeToString(pub),
+			"privateKey": hex.EncodeToString(priv),
+		})
+
+	case "relax_blockNumber":
+		height := chain.Blocks[len(chain.Blocks)-1].Number
+		writeResult(w, req.ID, fmt.Sprintf("0x%x", height))
+
+	case "relax_getBlock":
+		writeResult(w, req.ID, chain.Blocks[len(chain.Blocks)-1])
+
+	case "relax_chainId":
+		writeResult(w, req.ID, "0x52454c4158")
+
+	case "relax_validateChain":
+		err := validChain(chain.Blocks)
+		if err != nil {
+			writeError(w, req.ID, -32000, err.Error())
+			return
+		}
+		writeResult(w, req.ID, map[string]interface{}{
+			"valid":  true,
+			"height": chain.Blocks[len(chain.Blocks)-1].Number,
+		})
+
+	case "relax_getBalance":
+		if len(params) != 1 {
+			writeError(w, req.ID, -32602, "expected [address]")
+			return
+		}
+		var address string
+		if json.Unmarshal(params[0], &address) != nil || !validAddress(address) {
+			writeError(w, req.ID, -32602, "invalid address")
+			return
+		}
+		s, err := confirmedState()
+		if err != nil {
+			writeError(w, req.ID, -32000, "chain state invalid")
+			return
+		}
+		writeResult(w, req.ID, map[string]interface{}{
+			"address": address,
+			"balance": s.Balances[address],
+			"unit":    "base units; 1000000 = 1 RLC",
+		})
+
+	case "relax_getNonce":
+		if len(params) != 1 {
+			writeError(w, req.ID, -32602, "expected [address]")
+			return
+		}
+		var address string
+		if json.Unmarshal(params[0], &address) != nil || !validAddress(address) {
+			writeError(w, req.ID, -32602, "invalid address")
+			return
+		}
+		s, err := stateWithPending()
+		if err != nil {
+			writeError(w, req.ID, -32000, "cannot calculate nonce")
+			return
+		}
+		writeResult(w, req.ID, s.Nonces[address])
+
+	case "relax_sendTransaction":
+		if len(params) != 1 {
+			writeError(w, req.ID, -32602, "expected [transaction]")
+			return
+		}
+		var tx Transaction
+		if json.Unmarshal(params[0], &tx) != nil {
+			writeError(w, req.ID, -32602, "invalid transaction")
+			return
+		}
+		s, err := stateWithPending()
+		if err != nil {
+			writeError(w, req.ID, -32000, "cannot calculate pending state")
+			return
+		}
+		if err := applyTransaction(s, tx); err != nil {
+			writeError(w, req.ID, -32000, err.Error())
+			return
+		}
+		pending = append(pending, tx)
+		writeResult(w, req.ID, map[string]interface{}{
+			"accepted":     true,
+			"pendingCount": len(pending),
+		})
+
+	case "relax_mineBlock":
+		if len(params) != 1 {
+			writeError(w, req.ID, -32602, "expected [minerAddress]")
+			return
+		}
+		var miner string
+		if json.Unmarshal(params[0], &miner) != nil {
+			writeError(w, req.ID, -32602, "invalid miner address")
+			return
+		}
+
+		// Unlock because mineBlock acquires the chain mutex itself.
+		chain.mu.Unlock()
+		block, err := mineBlock(miner)
+		chain.mu.Lock()
+
+		if err != nil {
+			writeError(w, req.ID, -32000, err.Error())
+			return
+		}
+		writeResult(w, req.ID, block)
+
+	default:
+		writeError(w, req.ID, -32601, "method not found")
+	}
+}
+
+func main() {
+	if err := loadChain(); err != nil {
+		log.Fatalf("Cannot load blockchain: %v", err)
+	}
+
+	log.Println("RELAXCOIN NODE")
+	log.Printf("Genesis: %s", chain.Blocks[0].Hash)
+	log.Printf("Current height: %d", chain.Blocks[len(chain.Blocks)-1].Number)
+	log.Println("Chain ID: 0x52454c4158")
+	log.Println("RPC: http://127.0.0.1:8545")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", rpcHandler)
+
+	server := &http.Server{
+		Addr:              "127.0.0.1:8545",
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+	log.Fatal(server.ListenAndServe())
+}
